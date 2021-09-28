@@ -1,44 +1,115 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-
-#include <sys/timerfd.h>
 #include <sys/epoll.h>
 #include <pthread.h>
 #include <errno.h>
+#include <string.h>
+#include <sys/timerfd.h>
 #include <sys/time.h>
-
+#include "server_bench.h"
 #include "queue.h"
 
-#define HOST "127.0.0.1"
-#define PORT 8888
-#define MAX_COUNT 1000
 
-queue_t root;//等待发送数据队列
-int task_count = 0;
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
-
-uint64_t total_count = 0;
-uint64_t total_second = 0;
-
-int epfd=-1;
+struct requests_s{
+	int alive;                    // request是否alive
+	int threads;                  // 线程数,Number of threads to use
+	int duration;                 // 持续时间,Duration of test
+	int connections;              // 连接数上限,Connections to keep open
+	int connections_alive;        // 活跃的任务数
+	int total_connections;        // 总连接数
+	int done_connections;         // 已完成连接数
+	int64_t done_connections_time;// 已完成连接数耗时
+	int epfd;                     // epoll
+	int timerfd;                  // 定时器
+	pthread_mutex_t mutex;        // 锁
+	pthread_cond_t cond;          // 条件等待
+	pthread_barrier_t barrier;    // 栅栏
+	queue_t root;                 // 任务队列根
+};
 
 typedef struct{
-	int fd;
-	uint64_t request_time;
-	uint64_t response_time;
-	int (*callback)(void* arg);
-	queue_t node;
-}TRANS;
+	int fd;                               // fd
+	struct sockaddr * addr;               // 地址
+	socklen_t len;                        // 地址长度
+	void *arg;                            // 
+	uint64_t request_time;                // 请求时间
+	uint64_t response_time;               // 响应时间
+	int (*sendData)(int fd, void*arg);    // callback
+	int (*recvData)(int fd, void*arg);    // callback
+	queue_t node;                         // 任务队列结点
+}COMM;
 
-int init_sock(){
+requests_t* create_request(int threads, int duration, int connections,int total_connections){
+	requests_t *r = malloc(sizeof(requests_t));
+	r->alive = 0;
+	r->threads = threads;
+	r->duration = duration;
+	r->connections = connections;
+	r->connections_alive = 0;
+	r->total_connections = total_connections;
+	r->done_connections = 0;
+	r->epfd = -1;
+	pthread_mutex_init(&r->mutex,NULL);
+	pthread_cond_init(&r->cond,NULL);
+	queue_init(&r->root);
+	return r;
+}
+
+int request_add_trans(requests_t* r,struct sockaddr * addr,socklen_t len,void *arg,int (*sendData)(int fd,void*arg),int (*recvData)(int fd,void*arg)){
+	COMM *comm = malloc(sizeof(COMM));
+	comm->fd = -1;
+	comm->addr = addr;
+	comm->len = len;
+	comm->arg = arg;
+	comm->sendData = sendData;
+	comm->recvData = recvData;
+	queue_insert_tail(&r->root,&comm->node);
+	return 0;
+}
+
+void* recv_handler(void*arg){
+	requests_t* r = (requests_t*)arg;
+	COMM *comm;
+	int nready,i;
+
+	struct epoll_event *events = malloc(sizeof(struct epoll_event) * r->connections);
+	for(;r->alive==1 || r->connections_alive>0;){
+		nready = epoll_wait(r->epfd,events,r->connections,100);
+		if(nready == 0){
+			continue;
+		}
+
+		if(nready == -1){
+			continue;
+		}
+
+		for(i=0;i<nready;i++){
+			comm = (COMM*)events[i].data.ptr;
+			comm->recvData(comm->fd,comm->arg);
+			struct timeval tv;
+			gettimeofday(&tv,NULL);
+			comm->response_time = tv.tv_sec*1000000 + tv.tv_usec;
+			if(comm->fd == r->timerfd)
+				continue;
+			epoll_ctl(r->epfd,EPOLL_CTL_DEL,comm->fd,NULL);
+			close(comm->fd);
+			comm->fd = -1;
+			pthread_mutex_lock(&r->mutex);
+			r->done_connections++;
+			r->done_connections_time += (comm->response_time-comm->request_time);
+			queue_insert_tail(&r->root,&comm->node);
+			r->connections_alive--;
+			pthread_cond_signal(&r->cond);
+			pthread_mutex_unlock(&r->mutex);
+		}
+	}
+	free(events);
+	pthread_cond_broadcast(&r->cond);
+	pthread_exit(NULL);
+}
+
+int connect_sock(struct sockaddr* addr,socklen_t len){
 	int socketfd = socket(AF_INET,SOCK_STREAM,0);
 	if(socketfd == -1){
 		return -1;
@@ -49,13 +120,9 @@ int init_sock(){
         close(socketfd);
         return -1;
     }
-
-	struct sockaddr_in dest;
-	dest.sin_family = AF_INET;
-	dest.sin_port = htons(PORT);
-	inet_pton(AF_INET,HOST,&dest.sin_addr.s_addr);
 	
-	if(connect(socketfd,(struct sockaddr*)&dest,sizeof(dest)) == -1){
+	if(connect(socketfd,addr,len) == -1){
+		fprintf(stderr,"connect fail %d,%s\n",errno,strerror(errno));
 		close(socketfd);
 		return -1;
 	}
@@ -63,154 +130,85 @@ int init_sock(){
 	return socketfd;
 }
 
-void* thread_run(void*arg){
-	struct epoll_event events[MAX_COUNT+1];
-	int nready,i;
-	TRANS *trans;
-	for(;;){
-		nready = epoll_wait(epfd,events,MAX_COUNT+1,-1);
-		if(nready == 0){
+void* send_handler(void*arg){
+	requests_t* r = (requests_t*)arg;
+	COMM *comm;
+	queue_t *node;
+
+	pthread_barrier_wait(&r->barrier);
+
+	for(;r->done_connections < r->total_connections;){
+		pthread_mutex_lock(&r->mutex);
+		while(queue_empty(&r->root) || r->connections_alive >= r->connections){
+			//判断任务队列是否为空
+			pthread_cond_wait(&r->cond,&r->mutex);
+		}
+		if(r->done_connections >= r->total_connections){
+			pthread_mutex_unlock(&r->mutex);
+			break;
+		}
+		//获取任务队列头
+		node = queue_head(&r->root);
+		comm = queue_data(node,COMM,node);
+		//并移除
+		queue_remove(&comm->node);
+		r->connections_alive++;
+		// r->done_connections++;
+		// printf("alive %d, total_connections %d, done %d\n",r->connections_alive,r->total_connections,r->done_connections);
+		pthread_mutex_unlock(&r->mutex);
+
+		//connect
+		comm->fd = connect_sock(comm->addr,comm->len);
+		if(comm->fd == -1){
+			pthread_mutex_lock(&r->mutex);
+			queue_insert_tail(&r->root,&comm->node);
+			r->connections_alive--;
+			// r->done_connections--;
+			pthread_mutex_unlock(&r->mutex);
+			//sleep
 			continue;
 		}
 
-		if(nready == -1){
+		struct timeval tv;
+		gettimeofday(&tv,NULL);
+		comm->request_time = tv.tv_sec*1000000 + tv.tv_usec;
+
+		//发送失败
+		if(comm->sendData(comm->fd,comm->arg) == -1){
+			close(comm->fd);
+			pthread_mutex_lock(&r->mutex);
+			queue_insert_tail(&r->root,&comm->node);
+			r->connections_alive--;
+			// r->done_connections--;
+			pthread_mutex_unlock(&r->mutex);
+			//sleep
 			continue;
 		}
 
-		for(i=0;i<nready;i++){
-			trans = (TRANS*)events[i].data.ptr;
-			trans->callback(trans);
-		}
+		struct epoll_event ev;
+		ev.data.ptr = comm;
+		ev.events = EPOLLIN;
+		epoll_ctl(r->epfd,EPOLL_CTL_ADD,comm->fd,&ev);
 	}
 	pthread_exit(NULL);
 }
 
-int set_http_header(char *data,int size)
-{
-	char tmp[512] = {0};
-	int len=0;
-	len = sprintf(tmp, 
-		"POST / HTTP/1.1\r\n"
-        "Content-Type: application/xml\r\n"
-        "Connection: close\r\n"
-		"Host: %s:%d\r\n"
-        "Content-Length: %d\r\n"
-		"\r\n",HOST,PORT,size);
-	memmove(data+len,data,size);
-	memmove(data,tmp,len);
-	
-	return len+size;
-}
-
-int recvData_cb(void *arg);
-int sendData_cb(void *arg){
-	// printf("start send\n");
-	TRANS *trans = (TRANS*)arg;
-
-	trans->fd = init_sock();
-	if(trans->fd == -1){
-		printf("connect fail,errno%d,%s\n",errno,strerror(errno));
-		return -1;
-	}
-	// printf("connect finish\n");
-	//拼接数据
-	char sendData[4096] = {0};
-	int sendLen = 0;
-	sendLen = sprintf(sendData,"<?xml version=\"1.0\" encoding=\"utf-8\"?><apple></apple>");
-	sendLen = set_http_header(sendData,sendLen);
-	// printf("sendData[%d][%s]\n",sendLen,sendData);
-	//设置发送请求时间
-	struct timeval tv;
-	gettimeofday(&tv,NULL);
-	trans->request_time = tv.tv_sec*1000000 + tv.tv_usec;
-
-	//发送请求
-	if(send(trans->fd,sendData,sendLen,0) == -1){
-		printf("send fail,errno%d,%s\n",errno,strerror(errno));
-		close(trans->fd);
-		trans->fd = -1;
-	}
-	// printf("send finish\n");
-	//设置响应callback
-	trans->callback = recvData_cb;
-
-	//发送成功，由子线程接收响应数据
-	struct epoll_event ev;
-	ev.data.ptr = trans;
-	ev.events = EPOLLIN;
-	epoll_ctl(epfd,EPOLL_CTL_ADD,trans->fd,&ev);
-	return 0;
-}
-
-int recvData_cb(void *arg){
-	// printf("start recv\n");
-	TRANS *trans=(TRANS*)arg;
-
-	//接收数据
-	char recvData[4096] = {0};
-	int recvLen = 0;
-	recvLen = recv(trans->fd,recvData,sizeof(recvData),0);
-	if(recvLen < 0){
-		printf("recv fail,errno%d,%s\n",errno,strerror(errno));
-	}
-	//设置响应时间
-	struct timeval tv;
-	gettimeofday(&tv,NULL);
-	trans->response_time = tv.tv_sec*1000000 + tv.tv_usec;
-
-	//计算时差
-	total_count++;
-	total_second+=(trans->response_time-trans->request_time);
-
-	//移除epoll
-	epoll_ctl(epfd,EPOLL_CTL_DEL,trans->fd,NULL);
-
-	//关闭fd
-	close(trans->fd);
-	trans->fd = -1;
-
-	//重新加入任务队列, 并唤醒主线程
-	pthread_mutex_lock(&mutex);
-	queue_insert_tail(&root,&trans->node);
-	task_count++;
-	pthread_cond_signal(&cond);
-	pthread_mutex_unlock(&mutex);
-
-	return 0;
-}
-
-int per_count_cb(void *arg){
-	TRANS *trans = (TRANS*)arg;
+int recvTimerData(int fd,void *arg){
+	requests_t* r = (requests_t*)arg;
 	uint64_t count;
-	read(trans->fd,&count,sizeof(uint64_t));
-
-	static uint64_t old_total_count = 0;
-	if(total_count > 0){
-		printf("task %d, request %lu r/s, total_count %lu r, total_second %lf s, average cost %lf s/r\n",
-			task_count,
-			total_count-old_total_count,
-			total_count,
-			total_second/1000000.0,
-			(total_second/1000000.0)/total_count
-		);
+	read(fd,&count,sizeof(uint64_t));
+	if(r->done_connections > 0){
+		printf("alive request %d, total_request %lu r, total_second %lf s，average cost %lf s/r\n",
+		r->connections_alive,r->done_connections,r->done_connections_time/1000000.0,r->done_connections_time/1000000.0/r->done_connections);
 	}else{
-		printf("task %d, request %lu r/s, total_count %lu r, total_second %lf s, average cost %lf s/r\n",
-			task_count,
-			total_count-old_total_count,
-			total_count,
-			total_second/1000000.0,
-			0.0
-		);
+		printf("alive request %d, total_request %lu r, total_second %lf s，average cost %lf s/r\n",
+		r->connections_alive,r->done_connections,r->done_connections_time/1000000.0,0.0);
 	}
-	
-	old_total_count = total_count;
 	return 0;
 }
 
-int init_timer(){
-	TRANS *trans;
-	trans = malloc(sizeof(TRANS));
-	trans->fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+int request_set_timerfd(requests_t* r){
+	r->timerfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
 	struct timespec startTime, intervalTime;
     startTime.tv_sec = 1;    
     startTime.tv_nsec = 0;                                
@@ -219,69 +217,69 @@ int init_timer(){
 	struct itimerspec newValue;
     newValue.it_value = startTime;                        //首次超时时间
     newValue.it_interval = intervalTime;                  //首次超时后，每隔it_interval超时一次
-	
-	timerfd_settime(trans->fd, 0, &newValue, NULL);
-	trans->callback = per_count_cb;
+	timerfd_settime(r->timerfd, 0, &newValue, NULL);
+
+	COMM *comm = malloc(sizeof(COMM));
+	comm->fd = r->timerfd;
+	comm->addr = NULL;
+	comm->len = 0;
+	comm->arg = r;
+	comm->sendData = NULL;
+	comm->recvData = recvTimerData;
 
 	struct epoll_event ev;
-	ev.data.ptr = trans;
+	ev.data.ptr = comm;
 	ev.events = EPOLLIN;
-	epoll_ctl(epfd,EPOLL_CTL_ADD,trans->fd,&ev);
+	epoll_ctl(r->epfd,EPOLL_CTL_ADD,r->timerfd,&ev);
 	return 0;
 }
 
-int main(){
-	//创建epfd
-    epfd = epoll_create(1);
-    if(epfd == -1){
-		printf("epoll_create fail, errno%d,%s\n",errno,strerror(errno));
-		exit(1);
-	}
-
-	//创建等待发送数据队列root
-	queue_init(&root);
-
-	//创建所有待发送任务，并加入到队列尾
-	TRANS *trans;
-	queue_t *node;
+int request_loop(requests_t* r){
+	pthread_t tid_recv_handler;
+	pthread_t *tid_send_handler = malloc(sizeof(pthread_t) * r->threads);
 	int i;
-	for(i=0;i<MAX_COUNT;i++){
-		trans = malloc(sizeof(TRANS));
-		trans->fd = -1;
-		queue_init(&trans->node);
-		queue_insert_tail(&root,&trans->node);
-		task_count++;
+
+	r->alive = 1;
+	r->epfd = epoll_create(1);
+	request_set_timerfd(r);
+	pthread_mutex_init(&r->mutex,NULL);
+	pthread_cond_init(&r->cond,NULL);
+	
+	pthread_create(&tid_recv_handler,NULL,recv_handler,r);
+
+	pthread_barrier_init(&r->barrier,NULL,r->threads+1);
+	for(i=0;i<r->threads;i++){
+		pthread_create(&tid_send_handler[i],NULL,send_handler,r);
+	}
+	
+	pthread_barrier_wait(&r->barrier);
+	pthread_barrier_destroy(&r->barrier);
+	
+	for(i=0;i<r->threads;i++){
+		pthread_join(tid_send_handler[i],NULL);
+	}
+	
+	r->alive = 0;
+	pthread_join(tid_recv_handler,NULL);
+	
+	pthread_mutex_lock(&r->mutex);
+	pthread_cond_destroy(&r->cond);
+	pthread_mutex_destroy(&r->mutex);
+
+	close(r->epfd);
+	return 0;
+}
+
+void request_destroy(requests_t* r){
+	COMM *comm;
+	queue_t *node;
+
+	while(!queue_empty(&r->root)){
+		node = queue_head(&r->root);
+		comm = queue_data(node,COMM,node);
+		queue_remove(&comm->node);
+		free(comm);
 	}
 
-	init_timer();
-
-	//创建子线程接收数据
-	pthread_t tid;
-	pthread_create(&tid,NULL,thread_run,NULL);
-
-	for(;;){
-		pthread_mutex_lock(&mutex);
-		while(queue_empty(&root)){
-			//判断任务队列是否为空
-			pthread_cond_wait(&cond,&mutex);
-		}
-		//获取任务队列头
-		node = queue_head(&root);
-		trans = queue_data(node,TRANS,node);
-		//并移除
-		queue_remove(&trans->node);
-		task_count--;
-		pthread_mutex_unlock(&mutex);
-
-		
-		//发送请求
-		if(sendData_cb(trans) == -1){
-			//发送失败, 放回任务队列尾
-			pthread_mutex_lock(&mutex);
-			queue_insert_tail(&root,&trans->node);
-			task_count++;
-			pthread_mutex_unlock(&mutex);
-			continue;
-		}
-	}
+	free(r);
 }

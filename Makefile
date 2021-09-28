@@ -6,11 +6,11 @@ OBJ := $(patsubst src/%.c, obj/%.o, $(SRC))
 
 CC     := gcc
 
-TARGET := server_bench
+TARGET := bench
 
 all: obj $(TARGET)
 
-server_bench: server_bench.o
+bench: bench.o server_bench.o
 	$(CC) -o $@ $^ -lpthread
 
 $(OBJ): obj/%.o : src/%.c
