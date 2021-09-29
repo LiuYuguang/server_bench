@@ -53,16 +53,18 @@ int recvData(int fd,void*arg){
 }
 
 int main(){
-    requests_t* r = create_request(4,-1,1000,10000000);
+    requests_t* r = create_request(4,10,1000,10000000);
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
     inet_pton(AF_INET,HOST,&addr.sin_addr.s_addr);
+
+    request_set_host_port(r,(struct sockaddr *)&addr,sizeof(addr));
     
     int i;
     for(i=0;i<1000;i++)
-        request_add_trans(r,(struct sockaddr *)&addr,sizeof(addr),NULL,sendData,recvData);
+        request_add_trans(r,NULL,sendData,recvData);
     
     request_loop(r);
 

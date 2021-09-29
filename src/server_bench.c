@@ -12,37 +12,40 @@
 
 
 struct requests_s{
-	int alive;                    // request是否alive
-	int threads;                  // 线程数,Number of threads to use
-	int duration;                 // 持续时间,Duration of test
-	int connections;              // 连接数上限,Connections to keep open
-	int connections_alive;        // 活跃的任务数
-	int total_connections;        // 总连接数
-	int done_connections;         // 已完成连接数
-	int64_t done_connections_time;// 已完成连接数耗时
+	uint8_t alive;                    // request是否alive
+	uint8_t timeout;
+	uint8_t threads;                  // 线程数,Number of threads to use
+	int32_t duration;                 // 持续时间,Duration of test
+	uint32_t connections;              // 连接数上限,Connections to keep open
+	uint32_t connections_alive;        // 活跃的任务数
+	uint64_t total_connections;        // 总连接数
+	uint64_t done_connections;         // 已完成连接数
+	uint64_t done_connections_time;// 已完成连接数耗时
 	int epfd;                     // epoll
 	int timerfd;                  // 定时器
+	int timeoutfd;
 	pthread_mutex_t mutex;        // 锁
 	pthread_cond_t cond;          // 条件等待
 	pthread_barrier_t barrier;    // 栅栏
+	struct sockaddr * addr;       // 地址
+	socklen_t len;                // 地址长度
 	queue_t root;                 // 任务队列根
 };
 
 typedef struct{
 	int fd;                               // fd
-	struct sockaddr * addr;               // 地址
-	socklen_t len;                        // 地址长度
 	void *arg;                            // 
 	uint64_t request_time;                // 请求时间
 	uint64_t response_time;               // 响应时间
-	int (*sendData)(int fd, void*arg);    // callback
-	int (*recvData)(int fd, void*arg);    // callback
+	callback sendData;                    // callback
+	callback recvData;                    // callback
 	queue_t node;                         // 任务队列结点
 }COMM;
 
-requests_t* create_request(int threads, int duration, int connections,int total_connections){
+requests_t* create_request(uint8_t threads, int32_t duration, uint32_t connections,uint64_t total_connections){
 	requests_t *r = malloc(sizeof(requests_t));
 	r->alive = 0;
+	r->timeout = 0;
 	r->threads = threads;
 	r->duration = duration;
 	r->connections = connections;
@@ -50,17 +53,26 @@ requests_t* create_request(int threads, int duration, int connections,int total_
 	r->total_connections = total_connections;
 	r->done_connections = 0;
 	r->epfd = -1;
+	r->timerfd = -1;
+	r->timeoutfd = -1;
+	r->addr = NULL;
+	r->len = 0;
 	pthread_mutex_init(&r->mutex,NULL);
 	pthread_cond_init(&r->cond,NULL);
 	queue_init(&r->root);
 	return r;
 }
 
-int request_add_trans(requests_t* r,struct sockaddr * addr,socklen_t len,void *arg,int (*sendData)(int fd,void*arg),int (*recvData)(int fd,void*arg)){
+int request_set_host_port(requests_t* r,struct sockaddr * addr,socklen_t len){
+	r->addr = malloc(len);
+	memcpy(r->addr,addr,len);
+	r->len = len;
+	return 0;
+}
+
+int request_add_trans(requests_t* r,void *arg,callback sendData,callback recvData){
 	COMM *comm = malloc(sizeof(COMM));
 	comm->fd = -1;
-	comm->addr = addr;
-	comm->len = len;
 	comm->arg = arg;
 	comm->sendData = sendData;
 	comm->recvData = recvData;
@@ -92,6 +104,10 @@ void* recv_handler(void*arg){
 			comm->response_time = tv.tv_sec*1000000 + tv.tv_usec;
 			if(comm->fd == r->timerfd)
 				continue;
+			if(comm->fd == r->timeoutfd){
+				close(r->timeoutfd);
+				continue;	
+			}
 			epoll_ctl(r->epfd,EPOLL_CTL_DEL,comm->fd,NULL);
 			close(comm->fd);
 			comm->fd = -1;
@@ -137,13 +153,13 @@ void* send_handler(void*arg){
 
 	pthread_barrier_wait(&r->barrier);
 
-	for(;r->done_connections < r->total_connections;){
+	for(;r->timeout==0 && r->done_connections < r->total_connections;){
 		pthread_mutex_lock(&r->mutex);
 		while(queue_empty(&r->root) || r->connections_alive >= r->connections){
 			//判断任务队列是否为空
 			pthread_cond_wait(&r->cond,&r->mutex);
 		}
-		if(r->done_connections >= r->total_connections){
+		if(r->timeout==1 || r->done_connections >= r->total_connections){
 			pthread_mutex_unlock(&r->mutex);
 			break;
 		}
@@ -158,7 +174,7 @@ void* send_handler(void*arg){
 		pthread_mutex_unlock(&r->mutex);
 
 		//connect
-		comm->fd = connect_sock(comm->addr,comm->len);
+		comm->fd = connect_sock(r->addr,r->len);
 		if(comm->fd == -1){
 			pthread_mutex_lock(&r->mutex);
 			queue_insert_tail(&r->root,&comm->node);
@@ -221,8 +237,6 @@ int request_set_timerfd(requests_t* r){
 
 	COMM *comm = malloc(sizeof(COMM));
 	comm->fd = r->timerfd;
-	comm->addr = NULL;
-	comm->len = 0;
 	comm->arg = r;
 	comm->sendData = NULL;
 	comm->recvData = recvTimerData;
@@ -234,6 +248,40 @@ int request_set_timerfd(requests_t* r){
 	return 0;
 }
 
+int timeout_handler(int fd,void *arg){
+	requests_t* r = (requests_t*)arg;
+	uint64_t count;
+	read(fd,&count,sizeof(uint64_t));
+	r->timeout = 1;
+
+	return 0;
+}
+
+int request_set_timeoutfd(requests_t* r){
+	r->timeoutfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
+	struct timespec startTime, intervalTime;
+    startTime.tv_sec = r->duration;    
+    startTime.tv_nsec = 0;                                
+    intervalTime.tv_sec = 0;                             
+    intervalTime.tv_nsec = 0;
+	struct itimerspec newValue;
+    newValue.it_value = startTime;                        //首次超时时间
+    newValue.it_interval = intervalTime;                  //首次超时后，每隔it_interval超时一次
+	timerfd_settime(r->timeoutfd, 0, &newValue, NULL);
+
+	COMM *comm = malloc(sizeof(COMM));
+	comm->fd = r->timeoutfd;
+	comm->arg = r;
+	comm->sendData = NULL;
+	comm->recvData = timeout_handler;
+
+	struct epoll_event ev;
+	ev.data.ptr = comm;
+	ev.events = EPOLLIN;
+	epoll_ctl(r->epfd,EPOLL_CTL_ADD,r->timeoutfd,&ev);
+	return 0;
+}
+
 int request_loop(requests_t* r){
 	pthread_t tid_recv_handler;
 	pthread_t *tid_send_handler = malloc(sizeof(pthread_t) * r->threads);
@@ -242,6 +290,9 @@ int request_loop(requests_t* r){
 	r->alive = 1;
 	r->epfd = epoll_create(1);
 	request_set_timerfd(r);
+	if(r->duration > 0){
+		request_set_timeoutfd(r);
+	}
 	pthread_mutex_init(&r->mutex,NULL);
 	pthread_cond_init(&r->cond,NULL);
 	
@@ -258,7 +309,7 @@ int request_loop(requests_t* r){
 	for(i=0;i<r->threads;i++){
 		pthread_join(tid_send_handler[i],NULL);
 	}
-	
+
 	r->alive = 0;
 	pthread_join(tid_recv_handler,NULL);
 	
@@ -281,5 +332,6 @@ void request_destroy(requests_t* r){
 		free(comm);
 	}
 
+	free(r->addr);
 	free(r);
 }
