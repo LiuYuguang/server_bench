@@ -10,7 +10,7 @@
 #define HOST "127.0.0.1"
 #define PORT 8888
 
-int set_http_header(char *data,int size)
+inline int set_http_header(char *data,int size)
 {
 	char tmp[512] = {0};
 	int len=0;
@@ -28,15 +28,13 @@ int set_http_header(char *data,int size)
 }
 
 int sendData(int fd,void*arg){
+    int n = *(int*)arg;
     char sendData[4096] = {0};
 	int sendLen = 0;
-	sendLen = sprintf(sendData,"<?xml version=\"1.0\" encoding=\"utf-8\"?><apple></apple>");
+	sendLen = sprintf(sendData,"<?xml version=\"1.0\" encoding=\"utf-8\"?><apple>%d</apple>",n);
 	sendLen = set_http_header(sendData,sendLen);
 
     sendLen = send(fd,sendData,sendLen,0);
-    if(sendLen == -1){
-        fprintf(stderr,"send fail %d,%s",errno,strerror(errno));
-    }
     return sendLen;
 }
 
@@ -45,15 +43,11 @@ int recvData(int fd,void*arg){
 	int recvLen = 0;
 
     recvLen =  recv(fd,recvData,sizeof(recvData),0);
-    if(recvLen == -1){
-        fprintf(stderr,"recv fail %d,%s",errno,strerror(errno));
-    }
-    // printf("recv[%d]%s\n",recvLen,recvData);
     return recvLen;
 }
 
 int main(){
-    requests_t* r = create_request(4,10,1000,10000000);
+    requests_t* r = create_request(4,3,10,100);
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -62,9 +56,11 @@ int main(){
 
     request_set_host_port(r,(struct sockaddr *)&addr,sizeof(addr));
     
+    int data[1000];
     int i;
     for(i=0;i<1000;i++){
-        request_add_trans(r,NULL,sendData,recvData);
+        data[i] = i;
+        request_add_trans(r,&data[i],sendData,recvData);
     }
     
     request_loop(r);
