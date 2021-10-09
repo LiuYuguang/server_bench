@@ -63,8 +63,9 @@ int main(){
     request_set_host_port(r,(struct sockaddr *)&addr,sizeof(addr));
     
     int i;
-    for(i=0;i<1000;i++)
+    for(i=0;i<1000;i++){
         request_add_trans(r,NULL,sendData,recvData);
+    }
     
     request_loop(r);
 
