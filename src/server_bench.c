@@ -26,10 +26,15 @@ struct requests_s{
 	pthread_mutex_t mutex;             // 锁
 	pthread_cond_t cond;               // 条件等待
 	pthread_barrier_t barrier;         // 栅栏
-	struct sockaddr * addr;            // 地址
-	socklen_t len;                     // 地址长度
+	queue_t addr_root;                 // 地址根
 	queue_t root;                      // 任务队列根
 };
+
+typedef struct{
+	struct sockaddr * addr;
+	socklen_t len;
+	queue_t node;
+}ADDR;
 
 typedef struct{
 	int fd;                            // fd
@@ -54,8 +59,7 @@ requests_t* create_request(uint8_t threads, int32_t duration, uint32_t comm_per_
 	r->epfd = -1;
 	r->timerfd = -1;
 	r->timeoutfd = -1;
-	r->addr = NULL;
-	r->len = 0;
+	queue_init(&r->addr_root);
 	pthread_mutex_init(&r->mutex,NULL);
 	pthread_cond_init(&r->cond,NULL);
 	queue_init(&r->root);
@@ -63,9 +67,16 @@ requests_t* create_request(uint8_t threads, int32_t duration, uint32_t comm_per_
 }
 
 int request_set_host_port(requests_t* r,struct sockaddr * addr,socklen_t len){
-	r->addr = malloc(len);
-	memcpy(r->addr,addr,len);
-	r->len = len;
+	ADDR *d = malloc(sizeof(ADDR));
+	d->addr = NULL;
+	d->len = 0;
+	queue_init(&d->node);
+	
+	d->addr = malloc(len);
+	memcpy(d->addr,addr,len);
+	d->len = len;
+
+	queue_insert_tail(&r->addr_root,&d->node);
 	return 0;
 }
 
@@ -116,6 +127,7 @@ void* recv_handler(void*arg){
 				continue;	
 			}else{
 				epoll_ctl(r->epfd,EPOLL_CTL_DEL,comm->fd,NULL);
+				shutdown(comm->fd,SHUT_WR);
 				close(comm->fd);
 				comm->fd = -1;
 				pthread_mutex_lock(&r->mutex);
@@ -158,9 +170,11 @@ void* send_handler(void*arg){
 	requests_t* r = (requests_t*)arg;
 	COMM *comm;
 	queue_t *node;
-
+	ADDR *d;
+	queue_t *addr_node;
 	pthread_barrier_wait(&r->barrier);
 
+	addr_node = queue_head(&r->addr_root);
 	for(;r->alive==1 && r->comm_done < r->comm_total_count_limit;){
 		pthread_mutex_lock(&r->mutex);
 		while(queue_empty(&r->root) || r->comm_alive >= r->comm_per_second_limit){
@@ -180,7 +194,12 @@ void* send_handler(void*arg){
 		pthread_mutex_unlock(&r->mutex);
 
 		//connect
-		comm->fd = connect_sock(r->addr,r->len);
+		d = queue_data(addr_node,ADDR,node);
+		addr_node = queue_next(addr_node);
+		if(addr_node == queue_sentinel(&r->addr_root)){
+			addr_node = queue_head(&r->addr_root);
+		}
+		comm->fd = connect_sock(d->addr,d->len);
 		if(comm->fd == -1){
 			pthread_mutex_lock(&r->mutex);
 			queue_insert_tail(&r->root,&comm->node);
@@ -296,6 +315,16 @@ int request_set_timeoutfd(requests_t* r){
 }
 
 int request_loop(requests_t* r){
+	if(queue_empty(&r->addr_root)){
+		fprintf(stderr,"please set addr\n");
+		return -1;
+	}
+
+	if(queue_empty(&r->root)){
+		fprintf(stderr,"please set trans\n");
+		return -1;
+	}
+
 	pthread_t tid_recv_handler;
 	pthread_t *tid_send_handler = malloc(sizeof(pthread_t) * r->threads);
 	int i;
@@ -374,6 +403,16 @@ void request_destroy(requests_t* r){
 	COMM *comm;
 	queue_t *node;
 
+	ADDR *d;
+	queue_t *addr_node;
+	while(!queue_empty(&r->addr_root)){
+		addr_node = queue_head(&r->addr_root);
+		d = queue_data(addr_node,ADDR,node);
+		queue_remove(&d->node);
+		free(d->addr);
+		free(d);
+	}
+
 	while(!queue_empty(&r->root)){
 		node = queue_head(&r->root);
 		comm = queue_data(node,COMM,node);
@@ -381,6 +420,5 @@ void request_destroy(requests_t* r){
 		free(comm);
 	}
 
-	free(r->addr);
 	free(r);
 }
