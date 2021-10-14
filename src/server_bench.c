@@ -71,7 +71,7 @@ int request_set_host_port(requests_t* r,struct sockaddr * addr,socklen_t len){
 	d->addr = NULL;
 	d->len = 0;
 	queue_init(&d->node);
-	
+
 	d->addr = malloc(len);
 	memcpy(d->addr,addr,len);
 	d->len = len;
@@ -152,17 +152,17 @@ int connect_sock(struct sockaddr* addr,socklen_t len){
 	}
 
 	int flag = 1;
-    if(setsockopt(socketfd,SOL_SOCKET,SO_REUSEADDR,&flag,sizeof(flag)) < 0){
-        close(socketfd);
-        return -1;
-    }
-	
+	if(setsockopt(socketfd,SOL_SOCKET,SO_REUSEADDR,&flag,sizeof(flag)) < 0){
+		close(socketfd);
+		return -1;
+	}
+
 	if(connect(socketfd,addr,len) == -1){
 		fprintf(stderr,"connect fail %d,%s\n",errno,strerror(errno));
 		close(socketfd);
 		return -1;
 	}
-	
+
 	return socketfd;
 }
 
@@ -254,13 +254,13 @@ int recvTimerData(int fd,void *arg){
 int request_set_timerfd(requests_t* r){
 	r->timerfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
 	struct timespec startTime, intervalTime;
-    startTime.tv_sec = 1;    
-    startTime.tv_nsec = 0;                                
-    intervalTime.tv_sec = 1;                             
-    intervalTime.tv_nsec = 0;
+	startTime.tv_sec = 1;    
+	startTime.tv_nsec = 0;                                
+	intervalTime.tv_sec = 1;                             
+	intervalTime.tv_nsec = 0;
 	struct itimerspec newValue;
-    newValue.it_value = startTime;                        //首次超时时间
-    newValue.it_interval = intervalTime;                  //首次超时后，每隔it_interval超时一次
+	newValue.it_value = startTime;                        //首次超时时间
+	newValue.it_interval = intervalTime;                  //首次超时后，每隔it_interval超时一次
 	timerfd_settime(r->timerfd, 0, &newValue, NULL);
 
 	COMM *comm = malloc(sizeof(COMM));
@@ -290,13 +290,13 @@ int timeout_handler(int fd,void *arg){
 int request_set_timeoutfd(requests_t* r){
 	r->timeoutfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK);
 	struct timespec startTime, intervalTime;
-    startTime.tv_sec = r->duration;    
-    startTime.tv_nsec = 0;                                
-    intervalTime.tv_sec = 0;                             
-    intervalTime.tv_nsec = 0;
+	startTime.tv_sec = r->duration;    
+	startTime.tv_nsec = 0;                                
+	intervalTime.tv_sec = 0;                             
+	intervalTime.tv_nsec = 0;
 	struct itimerspec newValue;
-    newValue.it_value = startTime;                        //首次超时时间
-    newValue.it_interval = intervalTime;                  //首次超时后，每隔it_interval超时一次
+	newValue.it_value = startTime;                        //首次超时时间
+	newValue.it_interval = intervalTime;                  //首次超时后，每隔it_interval超时一次
 	timerfd_settime(r->timeoutfd, 0, &newValue, NULL);
 
 	COMM *comm = malloc(sizeof(COMM));
@@ -351,10 +351,10 @@ int request_loop(requests_t* r){
 	for(i=0;i<r->threads;i++){
 		pthread_create(&tid_send_handler[i],NULL,send_handler,r);
 	}
-	
+
 	pthread_barrier_wait(&r->barrier);
 	pthread_barrier_destroy(&r->barrier);
-	
+
 	//等待发送线程
 	for(i=0;i<r->threads;i++){
 		pthread_join(tid_send_handler[i],NULL);
@@ -363,14 +363,14 @@ int request_loop(requests_t* r){
 
 	//等待接收线程
 	pthread_join(tid_recv_handler,NULL);
-	
+
 	pthread_mutex_lock(&r->mutex);
 	pthread_cond_destroy(&r->cond);
 	pthread_mutex_destroy(&r->mutex);
 
 	close(r->epfd);
 	r->epfd = -1;
-	
+
 	if(r->timeoutfd != -1){
 		epoll_ctl(r->epfd,EPOLL_CTL_DEL,r->timeoutfd,NULL);
 		close(r->timeoutfd);
